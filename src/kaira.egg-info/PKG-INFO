@@ -1,3 +1,17 @@
+Metadata-Version: 2.4
+Name: kaira
+Version: 0.1.0
+Summary: High-performance data ingestion pipeline for Indian index options (NIFTY / BANKNIFTY).
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: duckdb>=0.10.0
+Requires-Dist: httpx>=0.27.0
+Requires-Dist: orjson>=3.9.0
+Requires-Dist: pyarrow>=15.0.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: tenacity>=8.0.0
+Requires-Dist: typer>=0.12.0
+
 # kaira
 
 High-performance data ingestion pipeline for Indian index options (NIFTY / BANKNIFTY), designed as a *small quant fund* data stack:
@@ -91,19 +105,19 @@ py -m pip install -e .
 Collect live option-chain snapshots (creates forward history):
 
 ```powershell
-py -m kaira collect nse-live --symbols NIFTY BANKNIFTY --interval-s 2 --duration-s 600
+kaira collect nse-live --symbols NIFTY BANKNIFTY --interval-s 2 --duration-s 600
 ```
 
 Backfill EOD FO bhavcopy (official, free):
 
 ```powershell
-py -m kaira backfill nse-bhavcopy --start 2024-01-01 --end 2024-03-31 --symbols NIFTY BANKNIFTY
+kaira backfill nse-bhavcopy --start 2024-01-01 --end 2024-03-31 --symbols NIFTY BANKNIFTY
 ```
 
 Compact partitions (coalesce small files; de-dup by latest `ingest_ts`):
 
 ```powershell
-py -m kaira maint compact-option-quotes --dataset-dir data/silver/option_quotes --min-files 10
+kaira maint compact-option-quotes --dataset-dir data/silver/option_quotes --min-files 10
 ```
 
 ## Backtest reads (DuckDB)
