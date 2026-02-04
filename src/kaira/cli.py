@@ -8,7 +8,7 @@ from typing import Annotated, Optional
 import typer
 
 from kaira.config import AppConfig
-from kaira.doctor import run_doctor
+from kaira.doctor.data import run_data_preflight
 from kaira.ingest.async_pipeline import collect_nse_live
 from kaira.maintenance.compact import CompactConfig, compact_option_quotes
 from kaira.providers.nse_bhavcopy import backfill_nse_fo_bhavcopy
@@ -17,10 +17,12 @@ app = typer.Typer(add_completion=False, help="kaira: Indian index options data p
 collect_app = typer.Typer(add_completion=False, help="Live collection / streaming ingestion")
 backfill_app = typer.Typer(add_completion=False, help="Historical backfills")
 maint_app = typer.Typer(add_completion=False, help="Maintenance / optimization")
+doctor_app = typer.Typer(add_completion=False, help="Preflight checks")
 
 app.add_typer(collect_app, name="collect")
 app.add_typer(backfill_app, name="backfill")
 app.add_typer(maint_app, name="maint")
+app.add_typer(doctor_app, name="doctor")
 
 
 @app.command("doctor")
@@ -118,3 +120,30 @@ def compact_option_quotes_cmd(
         trade_date_end=td_end,
         cfg=cfg,
     )
+
+
+@doctor_app.command("data")
+def doctor_data_cmd(
+    symbols: Annotated[list[str], typer.Option(help="Symbols to validate (e.g. NIFTY BANKNIFTY)")] = [
+        "NIFTY",
+        "BANKNIFTY",
+    ],
+    lookback_days: Annotated[int, typer.Option(help="How many days to search for a bhavcopy file")] = 10,
+    sample_rows: Annotated[int, typer.Option(help="How many sample rows to print")] = 5,
+    timeout_s: Annotated[float, typer.Option(help="HTTP timeout for bhavcopy download")] = 30.0,
+    verbosity: Annotated[int, typer.Option("-v", count=True, help="Increase log verbosity")] = 0,
+) -> None:
+    _setup_logging(verbosity)
+    result = run_data_preflight(
+        symbols=symbols,
+        lookback_days=lookback_days,
+        sample_rows=sample_rows,
+        timeout_s=timeout_s,
+    )
+    for msg in result.messages:
+        typer.echo(msg)
+    if result.ok:
+        typer.echo("PASS: data ingestion preflight complete.")
+    else:
+        typer.echo("FAIL: data ingestion preflight failed.")
+        raise typer.Exit(code=1)
