@@ -72,6 +72,42 @@ def _parse_expiry(s: str) -> date:
     return datetime.strptime(s, "%d-%b-%Y").date()
 
 
+def _normalize_bhavcopy_schema(fo_table: pa.Table, *, trade_date: date) -> pa.Table:
+    names = fo_table.schema.names
+    rename_map: dict[str, str] = {}
+    to_drop: list[str] = []
+    aliased: dict[str, str] = {}
+
+    for canonical, aliases in COLUMN_ALIASES.items():
+        available = [alias for alias in aliases if alias in names]
+        if not available:
+            continue
+        if canonical in names:
+            for alias in available:
+                if alias != canonical:
+                    to_drop.append(alias)
+                    aliased[alias] = canonical
+            continue
+        chosen = available[0]
+        if chosen != canonical:
+            rename_map[chosen] = canonical
+            aliased[chosen] = canonical
+        for alias in available[1:]:
+            to_drop.append(alias)
+            aliased[alias] = canonical
+
+    if rename_map:
+        renamed = [rename_map.get(name, name) for name in names]
+        fo_table = fo_table.rename_columns(renamed)
+    if to_drop:
+        fo_table = fo_table.drop(to_drop)
+    if aliased:
+        alias_pairs = ", ".join(f"{alias}->{canonical}" for alias, canonical in sorted(aliased.items()))
+        log.info("bhavcopy_columns_aliased trade_date=%s aliases=%s", trade_date, alias_pairs)
+
+    return fo_table
+
+
 def _bhavcopy_to_option_quotes(
     fo_table: pa.Table,
     *,
@@ -79,7 +115,7 @@ def _bhavcopy_to_option_quotes(
     symbols: set[str],
     ingest_ts: datetime,
     source: str = "nse_fo_bhavcopy",
-) -> pa.Table:
+) -> pa.Table | None:
     """
     Convert FO bhavcopy rows to canonical option-quotes schema.
 
@@ -89,7 +125,13 @@ def _bhavcopy_to_option_quotes(
     required_cols = {"INSTRUMENT", "SYMBOL", "EXPIRY_DT", "STRIKE_PR", "OPTION_TYP", "OPEN_INT", "TRD_QTY", "CLOSE"}
     missing = sorted(required_cols - set(fo_table.schema.names))
     if missing:
-        raise ValueError(f"Bhavcopy missing columns: {missing}")
+        log.warning(
+            "bhavcopy_missing_columns trade_date=%s missing=%s columns=%s",
+            trade_date,
+            missing,
+            fo_table.schema.names,
+        )
+        return None
 
     mask = pc.equal(fo_table["INSTRUMENT"], "OPTIDX")
     mask = pc.and_(mask, pc.is_in(fo_table["SYMBOL"], value_set=pa.array(sorted(symbols))))
@@ -214,17 +256,37 @@ async def _backfill_bhavcopy_async(
                 return
             async with sem:
                 try:
+                    url = nse_fo_bhavcopy_url(d)
                     zip_bytes = await downloader.download_zip(client, d)
                     if zip_bytes is None:
                         log.info("Bhavcopy not found (holiday?): %s", d)
                         return
+                    log.info(
+                        "bhavcopy_download_success trade_date=%s url=%s bytes=%d",
+                        d,
+                        url,
+                        len(zip_bytes),
+                    )
                     fo = await asyncio.to_thread(_read_zipped_csv, zip_bytes)
+                    log.info(
+                        "bhavcopy_parse_success trade_date=%s rows_parsed=%d columns=%d",
+                        d,
+                        fo.num_rows,
+                        len(fo.schema.names),
+                    )
                     table = await asyncio.to_thread(
                         _bhavcopy_to_option_quotes,
                         fo,
                         trade_date=d,
                         symbols=symbols_set,
                         ingest_ts=utc_now(),
+                    )
+                    if table is None:
+                        return
+                    log.info(
+                        "bhavcopy_rows_extracted trade_date=%s rows_extracted=%d",
+                        d,
+                        table.num_rows,
                     )
                     await queue.put(table)
                 except Exception:
@@ -236,15 +298,26 @@ async def _backfill_bhavcopy_async(
                 if item is None:
                     return
                 valid, invalid = validate_option_quotes(item, policy=policy)
+                trade_date = None
+                if item.num_rows:
+                    try:
+                        trade_date = item.column("ts_date")[0].as_py()
+                    except Exception:
+                        trade_date = None
                 if invalid.num_rows:
-                    trade_date = None
-                    if item.num_rows:
-                        try:
-                            trade_date = item.column("ts_date")[0].as_py()
-                        except Exception:
-                            trade_date = None
                     log.warning("Bhavcopy %s: %d invalid rows (dropping)", trade_date, invalid.num_rows)
+                log.info(
+                    "bhavcopy_rows_validated trade_date=%s rows_validated=%d rows_invalid=%d",
+                    trade_date,
+                    valid.num_rows,
+                    invalid.num_rows,
+                )
                 writer.append(valid)
+                log.info(
+                    "bhavcopy_rows_written trade_date=%s rows_written=%d",
+                    trade_date,
+                    valid.num_rows,
+                )
                 if writer.buffered_rows >= 2_000_000:
                     writer.flush()
 
