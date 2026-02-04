@@ -24,16 +24,27 @@ log = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-COLUMN_ALIASES: dict[str, list[str]] = {
-    "INSTRUMENT": ["INSTRUMENT", "INSTRUMENT_TYPE", "INSTRUMENTTY"],
-    "SYMBOL": ["SYMBOL", "SYMB", "UNDERLYING"],
-    "EXPIRY_DT": ["EXPIRY_DT", "EXPIRY", "EXP_DATE", "EXPIRYDATE"],
-    "STRIKE_PR": ["STRIKE_PR", "STRIKE", "STRIKEPRICE", "STRIKE_PRICE"],
-    "OPTION_TYP": ["OPTION_TYP", "OPTIONTYPE", "OPTION_TYPE", "OPT_TYP"],
-    "OPEN_INT": ["OPEN_INT", "OPENINTEREST", "OPEN_INTREST", "OI"],
-    "TRD_QTY": ["TRD_QTY", "CONTRACTS", "TOTTRDQTY", "TOT_TRD_QTY", "TOTAL_TRADE_QTY"],
-    "CLOSE": ["CLOSE", "CLOSE_PRICE", "CLOSING_PRICE", "SETTLE_PR", "SETTLE_PRICE"],
+_BHAVCOPY_COLUMN_ALIASES = {
+    "TRD_QTY": ("TRD_QTY", "TOTTRDQTY", "TOT_TRDQTY", "TOT_TRD_QTY"),
 }
+
+
+def _normalize_bhavcopy_columns(fo_table: pa.Table) -> pa.Table:
+    names = fo_table.schema.names
+    rename_map: dict[str, str] = {}
+    for canonical, aliases in _BHAVCOPY_COLUMN_ALIASES.items():
+        if canonical in names:
+            continue
+        for alias in aliases:
+            if alias in names:
+                rename_map[alias] = canonical
+                break
+
+    if not rename_map:
+        return fo_table
+
+    new_names = [rename_map.get(name, name) for name in names]
+    return fo_table.rename_columns(new_names)
 
 
 def _daterange(start: date, end: date) -> Iterable[date]:
@@ -110,7 +121,7 @@ def _bhavcopy_to_option_quotes(
 
     Bhavcopy is EOD; bid/ask/iv are not available and are stored as nulls.
     """
-    fo_table = _normalize_bhavcopy_schema(fo_table, trade_date=trade_date)
+    fo_table = _normalize_bhavcopy_columns(fo_table)
     required_cols = {"INSTRUMENT", "SYMBOL", "EXPIRY_DT", "STRIKE_PR", "OPTION_TYP", "OPEN_INT", "TRD_QTY", "CLOSE"}
     missing = sorted(required_cols - set(fo_table.schema.names))
     if missing:
@@ -153,7 +164,7 @@ def _bhavcopy_to_option_quotes(
             continue
 
         oid = option_id(symbol=s, expiry=expiry, strike=k, right=right)
-        iid = instrument_id(symbol=s, expiry=expiry, strike=k, right=right)
+        iid = _to_int64(instrument_id(symbol=s, expiry=expiry, strike=k, right=right))
 
         rows["ts"].append(ts)
         rows["ts_date"].append(ts_date)
@@ -177,6 +188,12 @@ def _bhavcopy_to_option_quotes(
 
     arrays = [pa.array(rows[f.name], type=f.type) for f in OPTION_QUOTES_SCHEMA]
     return pa.Table.from_arrays(arrays, schema=OPTION_QUOTES_SCHEMA)
+
+
+def _to_int64(value: int) -> int:
+    if value > 2**63 - 1:
+        return value - 2**64
+    return value
 
 
 @dataclass(frozen=True)
@@ -306,9 +323,12 @@ async def _backfill_bhavcopy_async(
 
         dates = [d for d in _daterange(start, end)]
         consumer_task = asyncio.create_task(_consumer())
-        async with asyncio.TaskGroup() as tg:
-            for d in dates:
-                tg.create_task(_producer(d))
+        if hasattr(asyncio, "TaskGroup"):
+            async with asyncio.TaskGroup() as tg:
+                for d in dates:
+                    tg.create_task(_producer(d))
+        else:
+            await asyncio.gather(*(_producer(d) for d in dates))
 
         await queue.put(None)
         await consumer_task
