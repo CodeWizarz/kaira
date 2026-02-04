@@ -8,6 +8,7 @@ from typing import Annotated, Optional
 import typer
 
 from kaira.config import AppConfig
+from kaira.doctor import run_doctor
 from kaira.ingest.async_pipeline import collect_nse_live
 from kaira.maintenance.compact import CompactConfig, compact_option_quotes
 from kaira.providers.nse_bhavcopy import backfill_nse_fo_bhavcopy
@@ -20,6 +21,22 @@ maint_app = typer.Typer(add_completion=False, help="Maintenance / optimization")
 app.add_typer(collect_app, name="collect")
 app.add_typer(backfill_app, name="backfill")
 app.add_typer(maint_app, name="maint")
+
+
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Run environment checks and report health status."""
+    results = run_doctor()
+    typer.echo("Kaira doctor report")
+    typer.echo("-" * 72)
+    all_ok = True
+    for result in results:
+        status = "✅" if result.ok else "❌"
+        line = f"{status} {result.name}: {result.detail}"
+        typer.echo(line)
+        all_ok = all_ok and result.ok
+    if not all_ok:
+        raise typer.Exit(code=1)
 
 
 def _setup_logging(verbosity: int) -> None:
