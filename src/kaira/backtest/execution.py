@@ -162,7 +162,7 @@ class ExecutionSimulator:
 
     def _fill_aggressive(self, order: Order, snapshot: MarketSnapshot) -> list[Fill]:
         liquidity = snapshot.ask_size if order.side == OrderSide.BUY else snapshot.bid_size
-        fill_qty = min(order.remaining_qty, max(liquidity, order.remaining_qty))
+        fill_qty = min(order.remaining_qty, max(liquidity, 0.0))
         base_price = snapshot.ask if order.side == OrderSide.BUY else snapshot.bid
         penalty = base_price * (self.config.spread_crossing_penalty_bps / 10000.0)
         price = base_price + penalty if order.side == OrderSide.BUY else base_price - penalty
