@@ -47,6 +47,12 @@ def _normalize_bhavcopy_columns(fo_table: pa.Table) -> pa.Table:
     return fo_table.rename_columns(new_names)
 
 
+def _log_event(level: int, event: str, **fields: object) -> None:
+    details = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    message = f"{event} {details}".strip()
+    log.log(level, message, extra={"event": event, **fields})
+
+
 def _daterange(start: date, end: date) -> Iterable[date]:
     d = start
     while d <= end:
@@ -125,6 +131,8 @@ def _bhavcopy_to_option_quotes(
     required_cols = {"INSTRUMENT", "SYMBOL", "EXPIRY_DT", "STRIKE_PR", "OPTION_TYP", "OPEN_INT", "TRD_QTY", "CLOSE"}
     missing = sorted(required_cols - set(fo_table.schema.names))
     if missing:
+        _log_event(logging.WARNING, "schema mismatch", source=source, missing=missing)
+        raise ValueError(f"Bhavcopy missing columns: {missing}")
         log.warning(
             "bhavcopy_missing_columns trade_date=%s missing=%s columns=%s",
             trade_date,
@@ -203,6 +211,7 @@ class NSEBhavcopyDownloader:
 
     async def download_zip(self, client: httpx.AsyncClient, d: date) -> bytes | None:
         url = nse_fo_bhavcopy_url(d)
+        _log_event(logging.INFO, "starting download", source="nse_fo_bhavcopy", trade_date=d, url=url)
         headers = {
             "accept": "application/zip,application/octet-stream,*/*",
             "user-agent": (
@@ -213,9 +222,26 @@ class NSEBhavcopyDownloader:
         }
         resp = await client.get(url, headers=headers)
         if resp.status_code == 404:
+            _log_event(
+                logging.INFO,
+                "completed download",
+                source="nse_fo_bhavcopy",
+                trade_date=d,
+                http_status=resp.status_code,
+                bytes=0,
+            )
             return None
         resp.raise_for_status()
-        return resp.content
+        content = resp.content
+        _log_event(
+            logging.INFO,
+            "completed download",
+            source="nse_fo_bhavcopy",
+            trade_date=d,
+            http_status=resp.status_code,
+            bytes=len(content),
+        )
+        return content
 
 
 def _read_zipped_csv(zip_bytes: bytes) -> pa.Table:
@@ -268,6 +294,12 @@ async def _backfill_bhavcopy_async(
                         len(zip_bytes),
                     )
                     fo = await asyncio.to_thread(_read_zipped_csv, zip_bytes)
+                    _log_event(
+                        logging.INFO,
+                        "rows parsed",
+                        dataset="fo_bhavcopy_csv",
+                        trade_date=d,
+                        rows=fo.num_rows,
                     log.info(
                         "bhavcopy_parse_success trade_date=%s rows_parsed=%d columns=%d",
                         d,
@@ -281,6 +313,13 @@ async def _backfill_bhavcopy_async(
                         symbols=symbols_set,
                         ingest_ts=utc_now(),
                     )
+                    _log_event(
+                        logging.INFO,
+                        "rows parsed",
+                        dataset="option_quotes",
+                        source="nse_fo_bhavcopy",
+                        trade_date=d,
+                        rows=table.num_rows,
                     if table is None:
                         return
                     log.info(
@@ -289,7 +328,22 @@ async def _backfill_bhavcopy_async(
                         table.num_rows,
                     )
                     await queue.put(table)
-                except Exception:
+                except httpx.HTTPError as exc:
+                    _log_event(
+                        logging.ERROR,
+                        "network failure",
+                        source="nse_fo_bhavcopy",
+                        trade_date=d,
+                        error=repr(exc),
+                    )
+                except Exception as exc:
+                    _log_event(
+                        logging.ERROR,
+                        "parsing failure",
+                        source="nse_fo_bhavcopy",
+                        trade_date=d,
+                        error=repr(exc),
+                    )
                     log.exception("Failed processing bhavcopy %s", d)
 
         async def _consumer() -> None:
@@ -305,6 +359,27 @@ async def _backfill_bhavcopy_async(
                     except Exception:
                         trade_date = None
                 if invalid.num_rows:
+                    trade_date = None
+                    if item.num_rows:
+                        try:
+                            trade_date = item.column("ts_date")[0].as_py()
+                        except Exception:
+                            trade_date = None
+                    _log_event(
+                        logging.WARNING,
+                        "dropped rows",
+                        source="nse_fo_bhavcopy",
+                        trade_date=trade_date,
+                        rows=invalid.num_rows,
+                    )
+                writer.append(valid)
+                _log_event(
+                    logging.INFO,
+                    "rows written",
+                    dataset="option_quotes",
+                    source="nse_fo_bhavcopy",
+                    rows=valid.num_rows,
+                    buffered_rows=writer.buffered_rows,
                     log.warning("Bhavcopy %s: %d invalid rows (dropping)", trade_date, invalid.num_rows)
                 log.info(
                     "bhavcopy_rows_validated trade_date=%s rows_validated=%d rows_invalid=%d",
