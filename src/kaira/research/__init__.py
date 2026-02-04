@@ -8,6 +8,10 @@ from kaira.research.regime_classifier import (
     regime_stability_bootstrap,
     summarize_regimes,
 )
+from kaira.research.mispricing_detector import (
+    MispricingDetectorConfig,
+    detect_mispricing_candidates,
+)
 
 __all__ = [
     "MarketRegimeClassifier",
@@ -16,4 +20,6 @@ __all__ = [
     "compute_regime_features",
     "regime_stability_bootstrap",
     "summarize_regimes",
+    "MispricingDetectorConfig",
+    "detect_mispricing_candidates",
 ]
