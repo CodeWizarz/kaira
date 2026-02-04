@@ -49,6 +49,12 @@ class SnapshotEvent:
     error: str | None = None
 
 
+def _log_event(level: int, event: str, **fields: Any) -> None:
+    details = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    message = f"{event} {details}".strip()
+    log.log(level, message, extra={"event": event, **fields})
+
+
 def _snapshot_log_row(ev: SnapshotEvent, *, records: int | None) -> pa.Table:
     ts_date = ist_trade_date(ev.ingest_ts)
     row = {
@@ -121,9 +127,31 @@ async def _collect_nse_live_async(
         while not stop.is_set():
             start = time.perf_counter()
             ingest_ts = utc_now()
+            _log_event(
+                logging.INFO,
+                "starting download",
+                source=source,
+                symbol=sym,
+                ingest_ts=ingest_ts.isoformat(),
+            )
             try:
                 payload = await client.fetch(sym)
                 latency_ms = int((time.perf_counter() - start) * 1000)
+                records = None
+                try:
+                    recs = (payload.get("records") or {}).get("data") or []
+                    if isinstance(recs, list):
+                        records = len(recs)
+                except Exception:
+                    records = None
+                _log_event(
+                    logging.INFO,
+                    "completed download",
+                    source=source,
+                    symbol=sym,
+                    latency_ms=latency_ms,
+                    records=records,
+                )
                 await queue.put(
                     SnapshotEvent(
                         symbol=sym,
@@ -136,6 +164,15 @@ async def _collect_nse_live_async(
                 )
             except httpx.HTTPStatusError as e:
                 latency_ms = int((time.perf_counter() - start) * 1000)
+                _log_event(
+                    logging.ERROR,
+                    "network failure",
+                    source=source,
+                    symbol=sym,
+                    latency_ms=latency_ms,
+                    http_status=e.response.status_code,
+                    error=str(e),
+                )
                 await queue.put(
                     SnapshotEvent(
                         symbol=sym,
@@ -147,8 +184,36 @@ async def _collect_nse_live_async(
                         error=str(e),
                     )
                 )
+            except httpx.HTTPError as e:
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                _log_event(
+                    logging.ERROR,
+                    "network failure",
+                    source=source,
+                    symbol=sym,
+                    latency_ms=latency_ms,
+                    error=repr(e),
+                )
+                await queue.put(
+                    SnapshotEvent(
+                        symbol=sym,
+                        source=source,
+                        status="error",
+                        ingest_ts=ingest_ts,
+                        latency_ms=latency_ms,
+                        error=repr(e),
+                    )
+                )
             except Exception as e:
                 latency_ms = int((time.perf_counter() - start) * 1000)
+                _log_event(
+                    logging.ERROR,
+                    "network failure",
+                    source=source,
+                    symbol=sym,
+                    latency_ms=latency_ms,
+                    error=repr(e),
+                )
                 await queue.put(
                     SnapshotEvent(
                         symbol=sym,
@@ -185,16 +250,50 @@ async def _collect_nse_live_async(
                     records = None
 
             snapshot_writer.append(_snapshot_log_row(ev, records=records))
+            _log_event(
+                logging.INFO,
+                "rows written",
+                dataset="snapshot_log",
+                source=ev.source,
+                symbol=ev.symbol,
+                rows=1,
+                buffered_rows=snapshot_writer.buffered_rows,
+            )
 
             if ev.status != "ok" or ev.payload is None:
                 continue
 
             try:
                 table = option_quotes_from_nse_option_chain(ev.payload, symbol=ev.symbol, ingest_ts=ev.ingest_ts)
+                _log_event(
+                    logging.INFO,
+                    "rows parsed",
+                    dataset="option_quotes",
+                    source=ev.source,
+                    symbol=ev.symbol,
+                    rows=table.num_rows,
+                )
                 valid, invalid = validate_option_quotes(table, policy=policy)
 
                 option_writer.append(valid)
+                _log_event(
+                    logging.INFO,
+                    "rows written",
+                    dataset="option_quotes",
+                    source=ev.source,
+                    symbol=ev.symbol,
+                    rows=valid.num_rows,
+                    buffered_rows=option_writer.buffered_rows,
+                )
                 if invalid.num_rows:
+                    _log_event(
+                        logging.WARNING,
+                        "dropped rows",
+                        dataset="option_quotes",
+                        source=ev.source,
+                        symbol=ev.symbol,
+                        rows=invalid.num_rows,
+                    )
                     invalid_writer.append(invalid)
                     _quarantine_payload(quarantine_dir / "payloads", ev=ev)
 
@@ -205,6 +304,12 @@ async def _collect_nse_live_async(
                 if invalid_writer.buffered_rows >= 100_000:
                     invalid_writer.flush()
             except Exception:
+                _log_event(
+                    logging.ERROR,
+                    "parsing failure",
+                    source=ev.source,
+                    symbol=ev.symbol,
+                )
                 log.exception("Failed parsing/validating NSE payload for %s", ev.symbol)
                 _quarantine_payload(quarantine_dir / "payloads", ev=ev)
 
@@ -260,4 +365,3 @@ def collect_nse_live(
         )
     except KeyboardInterrupt:
         log.warning("Interrupted by user; flushing buffers")
-

@@ -20,6 +20,12 @@ _NSE_TS_RE = re.compile(r"^\\d{2}-[A-Za-z]{3}-\\d{4}\\s+\\d{2}:\\d{2}:\\d{2}$")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+
+def _log_event(level: int, event: str, **fields: Any) -> None:
+    details = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    message = f"{event} {details}".strip()
+    log.log(level, message, extra={"event": event, **fields})
+
 def _parse_ist_timestamp_to_utc(ts: str) -> datetime | None:
     # IST has fixed offset +05:30.
     if not ts or not _NSE_TS_RE.match(ts):
@@ -54,6 +60,7 @@ def option_quotes_from_nse_option_chain(
 
     data = records.get("data") or []
     if not isinstance(data, list):
+        _log_event(logging.WARNING, "schema mismatch", source=source, symbol=symbol, field="records.data")
         raise ValueError("NSE payload missing records.data list")
 
     underlying_value = records.get("underlyingValue")
