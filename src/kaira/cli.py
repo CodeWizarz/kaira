@@ -25,6 +25,22 @@ app.add_typer(maint_app, name="maint")
 app.add_typer(doctor_app, name="doctor")
 
 
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Run environment checks and report health status."""
+    results = run_doctor()
+    typer.echo("Kaira doctor report")
+    typer.echo("-" * 72)
+    all_ok = True
+    for result in results:
+        status = "✅" if result.ok else "❌"
+        line = f"{status} {result.name}: {result.detail}"
+        typer.echo(line)
+        all_ok = all_ok and result.ok
+    if not all_ok:
+        raise typer.Exit(code=1)
+
+
 def _setup_logging(verbosity: int) -> None:
     level = logging.WARNING
     if verbosity == 1:
