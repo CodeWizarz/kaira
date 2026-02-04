@@ -122,8 +122,15 @@ async def _collect_nse_live_async(
             start = time.perf_counter()
             ingest_ts = utc_now()
             try:
+                log.info("event=starting_download source=%s symbol=%s", source, sym)
                 payload = await client.fetch(sym)
                 latency_ms = int((time.perf_counter() - start) * 1000)
+                log.info(
+                    "event=completed_download source=%s symbol=%s status=ok latency_ms=%d",
+                    source,
+                    sym,
+                    latency_ms,
+                )
                 await queue.put(
                     SnapshotEvent(
                         symbol=sym,
@@ -136,6 +143,14 @@ async def _collect_nse_live_async(
                 )
             except httpx.HTTPStatusError as e:
                 latency_ms = int((time.perf_counter() - start) * 1000)
+                log.error(
+                    "event=network_failure source=%s symbol=%s status=error http_status=%s latency_ms=%d error=%s",
+                    source,
+                    sym,
+                    e.response.status_code,
+                    latency_ms,
+                    str(e),
+                )
                 await queue.put(
                     SnapshotEvent(
                         symbol=sym,
@@ -149,6 +164,13 @@ async def _collect_nse_live_async(
                 )
             except Exception as e:
                 latency_ms = int((time.perf_counter() - start) * 1000)
+                log.error(
+                    "event=network_failure source=%s symbol=%s status=error latency_ms=%d error=%s",
+                    source,
+                    sym,
+                    latency_ms,
+                    repr(e),
+                )
                 await queue.put(
                     SnapshotEvent(
                         symbol=sym,
@@ -191,10 +213,35 @@ async def _collect_nse_live_async(
 
             try:
                 table = option_quotes_from_nse_option_chain(ev.payload, symbol=ev.symbol, ingest_ts=ev.ingest_ts)
+                log.info(
+                    "event=rows_parsed source=%s symbol=%s rows=%d ingest_ts=%s",
+                    ev.source,
+                    ev.symbol,
+                    table.num_rows,
+                    ev.ingest_ts.isoformat(),
+                )
                 valid, invalid = validate_option_quotes(table, policy=policy)
 
                 option_writer.append(valid)
+                log.info(
+                    "event=rows_written dataset=option_quotes source=%s symbol=%s rows=%d",
+                    ev.source,
+                    ev.symbol,
+                    valid.num_rows,
+                )
                 if invalid.num_rows:
+                    log.warning(
+                        "event=schema_mismatch source=%s symbol=%s invalid_rows=%d",
+                        ev.source,
+                        ev.symbol,
+                        invalid.num_rows,
+                    )
+                    log.warning(
+                        "event=dropped_rows source=%s symbol=%s dropped_rows=%d",
+                        ev.source,
+                        ev.symbol,
+                        invalid.num_rows,
+                    )
                     invalid_writer.append(invalid)
                     _quarantine_payload(quarantine_dir / "payloads", ev=ev)
 
@@ -205,7 +252,12 @@ async def _collect_nse_live_async(
                 if invalid_writer.buffered_rows >= 100_000:
                     invalid_writer.flush()
             except Exception:
-                log.exception("Failed parsing/validating NSE payload for %s", ev.symbol)
+                log.error(
+                    "event=parsing_failure source=%s symbol=%s error=failed_parsing",
+                    ev.source,
+                    ev.symbol,
+                    exc_info=True,
+                )
                 _quarantine_payload(quarantine_dir / "payloads", ev=ev)
 
     async with NSEOptionChainClient() as client:
@@ -260,4 +312,3 @@ def collect_nse_live(
         )
     except KeyboardInterrupt:
         log.warning("Interrupted by user; flushing buffers")
-

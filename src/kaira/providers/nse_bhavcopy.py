@@ -185,10 +185,16 @@ async def _backfill_bhavcopy_async(
                 return
             async with sem:
                 try:
+                    log.info("event=starting_download source=nse_fo_bhavcopy trade_date=%s", d)
                     zip_bytes = await downloader.download_zip(client, d)
                     if zip_bytes is None:
                         log.info("Bhavcopy not found (holiday?): %s", d)
                         return
+                    log.info(
+                        "event=completed_download source=nse_fo_bhavcopy trade_date=%s bytes=%d",
+                        d,
+                        len(zip_bytes),
+                    )
                     fo = await asyncio.to_thread(_read_zipped_csv, zip_bytes)
                     table = await asyncio.to_thread(
                         _bhavcopy_to_option_quotes,
@@ -197,9 +203,24 @@ async def _backfill_bhavcopy_async(
                         symbols=symbols_set,
                         ingest_ts=utc_now(),
                     )
+                    log.info(
+                        "event=rows_parsed source=nse_fo_bhavcopy trade_date=%s rows=%d",
+                        d,
+                        table.num_rows,
+                    )
                     await queue.put(table)
+                except httpx.HTTPError as e:
+                    log.error(
+                        "event=network_failure source=nse_fo_bhavcopy trade_date=%s error=%s",
+                        d,
+                        str(e),
+                    )
                 except Exception:
-                    log.exception("Failed processing bhavcopy %s", d)
+                    log.error(
+                        "event=parsing_failure source=nse_fo_bhavcopy trade_date=%s error=failed_processing",
+                        d,
+                        exc_info=True,
+                    )
 
         async def _consumer() -> None:
             while True:
@@ -214,8 +235,22 @@ async def _backfill_bhavcopy_async(
                             trade_date = item.column("ts_date")[0].as_py()
                         except Exception:
                             trade_date = None
-                    log.warning("Bhavcopy %s: %d invalid rows (dropping)", trade_date, invalid.num_rows)
+                    log.warning(
+                        "event=schema_mismatch source=nse_fo_bhavcopy trade_date=%s invalid_rows=%d",
+                        trade_date,
+                        invalid.num_rows,
+                    )
+                    log.warning(
+                        "event=dropped_rows source=nse_fo_bhavcopy trade_date=%s dropped_rows=%d",
+                        trade_date,
+                        invalid.num_rows,
+                    )
                 writer.append(valid)
+                log.info(
+                    "event=rows_written dataset=option_quotes source=nse_fo_bhavcopy trade_date=%s rows=%d",
+                    valid.column("ts_date")[0].as_py() if valid.num_rows else None,
+                    valid.num_rows,
+                )
                 if writer.buffered_rows >= 2_000_000:
                     writer.flush()
 
